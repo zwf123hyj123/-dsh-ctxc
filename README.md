@@ -35,6 +35,12 @@ dsh plugin --profile web add <本仓库目录>
 - 分块压缩实测：3008 字 → 1133 字（62%），5 块全过。
 - proot 环境 ~1.1-4 tok/s（冷/暖机差异大）。
 
+## 方案文档
+
+- [模型压缩方案](docs/compression-plan.md)：量化/蒸馏/混合并发压缩的完整路线
+- [上下文压缩方案](docs/context-compression.md)：ctxc.py 用法、云端自动切换、失败回退
+- 命令行全文压缩：`scripts/ctxc.py`（混合并发：本地 + 云端自动切换）
+
 ## 边界
 
 - 本地小模型只做**预筛**：摘要会丢细节，关键信息请保留原文指针。
