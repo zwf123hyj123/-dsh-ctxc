@@ -4,6 +4,7 @@
 # 用法:
 #   cat 长文.txt | python3 ctxc.py                     # ≤本地容量: 全本地；超出: 本地+云端并发
 #   python3 ctxc.py 文件.md --mode short --keep-paths
+# 出处：手机 proot 实测版 ctxc.py v2（本地 11436 + ofm 网关 18326 自动切换，并发实测 3250 字：本地 7 块/云端 2 块）。
 # 环境变量:
 #   CTXC_API            本地端点（默认 http://127.0.0.1:11436/v1/chat/completions）
 #   CTXC_MODEL          本地模型（默认 qwen2.5:1.5b-instruct）

@@ -35,6 +35,20 @@ dsh plugin --profile web add <本仓库目录>
 - 分块压缩实测：3008 字 → 1133 字（62%），5 块全过。
 - proot 环境 ~1.1-4 tok/s（冷/暖机差异大）。
 
+## 模块索引与出处
+
+| 模块 | 位置 | 出处 / 来源 |
+|---|---|---|
+| 「压一下」胶囊 | [lib/index.js](lib/index.js) | 手机 proot 实测版 local-ctxc 0.2.x，短文本地压、超长转当前对话云端压 |
+| 每轮自动会话卡 | [lib/index.js](lib/index.js)（turn.note 段） | 连续性卡体系：每轮原话样本滚动，2 分钟冷却、20MB 日志上限 |
+| 混合并发压缩 CLI | [scripts/ctxc.py](scripts/ctxc.py) | 本机 ctxc.py v2：本地 Ollama + 云端自动切换（dsh-our-free-model 网关 18326），两组线程并发 |
+| 模型压缩方案 | [docs/compression-plan.md](docs/compression-plan.md) | 量化/蒸馏/剪枝/上下文压缩路线（实测口径见文内） |
+| 上下文压缩方案 | [docs/context-compression.md](docs/context-compression.md) | 预筛原则、分块硬约束、失败回退、实测数据 |
+| CI 检查 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | 语法 + dshGo 清单校验（[validate.mjs](.github/scripts/validate.mjs)） |
+| Issue 模板 | [.github/ISSUE_TEMPLATE/](.github/ISSUE_TEMPLATE/) | 中文问题反馈 / 功能建议表单 |
+| Release 工作流 | [.github/workflows/release.yml](.github/workflows/release.yml) | 打 v* 标签自动打包 + 创建 Release |
+| npm 发布 | [.github/workflows/npm-publish.yml](.github/workflows/npm-publish.yml) | 配置 NPM_TOKEN 后自动发布，未配自动跳过 |
+
 ## 方案文档
 
 - [模型压缩方案](docs/compression-plan.md)：量化/蒸馏/混合并发压缩的完整路线
