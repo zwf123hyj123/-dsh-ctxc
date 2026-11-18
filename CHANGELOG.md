@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- ctxc.py v3：断点压缩（进度落盘、中断续传）+ 按功能/上下文分段（大段总结、小段原样保留）
+
+
 ## 0.2.1
 
 - 新增 scripts/ctxc.py：混合并发压缩（本地 Ollama + 云端自动切换，支持 dsh-our-free-model 网关与任意 OpenAI 兼容端点）

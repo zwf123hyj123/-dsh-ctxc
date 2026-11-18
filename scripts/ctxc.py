@@ -1,31 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ctxc.py v2 — 混合并发压缩：小段本地（Ollama），大段上云（OpenAI 兼容端点），并发跑、按序合并。
+# ctxc.py v3 — 断点压缩：按功能/上下文分段；大段总结、小段原样；进度落盘，中断后续传。
+# 参考断点下载：每完成一段立刻写盘，重跑只处理未完成的段（同一输入按内容哈希续传）。
+#
 # 用法:
-#   cat 长文.txt | python3 ctxc.py                     # ≤本地容量: 全本地；超出: 本地+云端并发
-#   python3 ctxc.py 文件.md --mode short --keep-paths
-# 出处：手机 proot 实测版 ctxc.py v2（本地 11436 + ofm 网关 18326 自动切换，并发实测 3250 字：本地 7 块/云端 2 块）。
+#   python3 ctxc.py 文件.md                     # 分段压缩，自动断点续传
+#   cat 长文.txt | python3 ctxc.py --keep-paths
+#   python3 ctxc.py 文件.md --fresh             # 放弃旧进度重压
 # 环境变量:
-#   CTXC_API            本地端点（默认 http://127.0.0.1:11436/v1/chat/completions）
-#   CTXC_MODEL          本地模型（默认 qwen2.5:1.5b-instruct）
-#   CTXC_LOCAL_MAX      本地最多压多少字（默认 2600，超出部分上云）
-#   CTXC_CLOUD_API      云端 OpenAI 兼容端点（不配则超出部分原样保留+指针）
-#   CTXC_CLOUD_KEY      云端 API Key
-#   CTXC_CLOUD_MODEL    云端模型名（默认 deepseek-chat）
-import sys, json, os, re, argparse, time
+#   CTXC_API / CTXC_MODEL       本地端点与模型（默认 127.0.0.1:11436 / qwen2.5:1.5b-instruct）
+#   CTXC_LOCAL_MAX              本地最多压多少字（默认 2600，超出上云）
+#   CTXC_SMALL_KEEP             多少字以下原样保留（默认 120）
+#   CTXC_STATE_DIR              断点状态目录（默认 /tmp/ctxc-state）
+#   CTXC_CLOUD_API/KEY/MODEL    云端端点（缺省走 dsh-our-free-model 网关自动切换）
+import sys, json, os, re, hashlib, argparse, time
 from concurrent.futures import ThreadPoolExecutor
 import urllib.request
 
 LOCAL_API = os.environ.get("CTXC_API", "http://127.0.0.1:11436/v1/chat/completions")
 LOCAL_MODEL = os.environ.get("CTXC_MODEL", "qwen2.5:1.5b-instruct")
 LOCAL_MAX = int(os.environ.get("CTXC_LOCAL_MAX", "2600"))
+SMALL_KEEP = int(os.environ.get("CTXC_SMALL_KEEP", "120"))
+STATE_DIR = os.environ.get("CTXC_STATE_DIR", "/tmp/ctxc-state")
+LOCAL_CHUNK = 380
+CLOUD_CHUNK = 1500
 CLOUD_API = os.environ.get("CTXC_CLOUD_API", "")
 CLOUD_KEY = os.environ.get("CTXC_CLOUD_KEY", "")
 CLOUD_MODEL = os.environ.get("CTXC_CLOUD_MODEL", "")
 OFM_SETTINGS = os.path.expanduser("~/.dsh/our-free-model/settings.json")
+SYSTEM = "你是上下文压缩器。把输入压缩成中文要点，每点不超过20字；保留数字、名称、结论，去掉客套与重复。只输出要点，不要解释。"
 
 def resolve_cloud():
-    """云端端点解析：显式 env 优先；否则走 dsh-our-free-model 的本地网关（自动切换）。"""
     if CLOUD_API:
         return CLOUD_API, CLOUD_KEY, CLOUD_MODEL or "kilo-auto/free"
     try:
@@ -38,21 +43,47 @@ def resolve_cloud():
     except Exception:
         pass
     return "", "", ""
-CHUNK = 380
-SYSTEM = "你是上下文压缩器。把输入压缩成中文要点，每点不超过20字；保留数字、名称、结论，去掉客套与重复。只输出要点，不要解释。"
 
-def chunk_text(text):
-    paras = re.split(r"(?<=[。！？\n])", text)
-    chunks, cur = [], ""
-    for p in paras:
-        if len(cur) + len(p) > CHUNK and cur:
-            chunks.append(cur)
+def segment(text):
+    """按功能/上下文分段：标题起新段；空行分段；小碎块合并；不打断语义单元。"""
+    raw = []
+    buf = []
+    for line in text.splitlines():
+        is_head = re.match(r"^#{1,6}\s", line) is not None
+        if (is_head or line.strip() == "") and buf:
+            raw.append("\n".join(buf).strip())
+            buf = []
+        if line.strip():
+            buf.append(line)
+    if buf:
+        raw.append("\n".join(buf).strip())
+    # 合并小碎块（<40 字并入后一段），标题段不合并
+    merged = []
+    i = 0
+    while i < len(raw):
+        seg = raw[i]
+        is_head = re.match(r"^#{1,6}\s", seg) is not None
+        if not is_head and len(seg) < 40 and merged:
+            merged[-1] = merged[-1] + "\n" + seg
+        else:
+            merged.append(seg)
+        i += 1
+    return [s for s in merged if s]
+
+def sub_chunk(seg, cap):
+    if len(seg) <= cap:
+        return [seg]
+    parts = re.split(r"(?<=[。！？；])", seg)
+    out, cur = [], ""
+    for p in parts:
+        if len(cur) + len(p) > cap and cur:
+            out.append(cur)
             cur = p
         else:
             cur += p
     if cur:
-        chunks.append(cur)
-    return chunks
+        out.append(cur)
+    return out
 
 def call(api, key, model, chunk, timeout=90):
     headers = {"Content-Type": "application/json"}
@@ -75,9 +106,9 @@ def call(api, key, model, chunk, timeout=90):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("file", nargs="?", help="文件（缺省读 stdin）")
-    ap.add_argument("--mode", choices=["bullets", "short"], default="bullets")
     ap.add_argument("--keep-paths", action="store_true")
-    ap.add_argument("--no-hybrid", action="store_true", help="禁用云端，超出部分原样保留")
+    ap.add_argument("--fresh", action="store_true", help="放弃旧进度重压")
+    ap.add_argument("--no-hybrid", action="store_true")
     args = ap.parse_args()
 
     if args.file:
@@ -87,86 +118,125 @@ def main():
         src = "stdin"
         text = sys.stdin.read()
 
-    chunks = chunk_text(text)
-    # 分配：前段给本地（累计 ≤ LOCAL_MAX），后段上云
-    local_chunks, cloud_chunks, acc = [], [], 0
-    for c in chunks:
-        if acc + len(c) <= LOCAL_MAX:
-            local_chunks.append(c)
-            acc += len(c)
+    h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    state_path = os.path.join(STATE_DIR, h + ".json")
+
+    def load_state():
+        try:
+            return json.load(open(state_path))
+        except Exception:
+            return None
+
+    def save_state(state):
+        tmp = state_path + ".tmp"
+        json.dump(state, open(tmp, "w"), ensure_ascii=False)
+        os.replace(tmp, state_path)
+
+    # ── 建立/恢复单元列表（断点续传核心）────────────────────
+    segs = segment(text)
+    state = None if args.fresh else load_state()
+    if state and state.get("units") is not None and state.get("count") == len(segs):
+        units = state["units"]
+        for u, s in zip(units, segs):
+            u["text"] = s  # 以当前输入为准
+        print("[ctxc] 断点续传：%d/%d 段已完成" % (
+            sum(1 for u in units if u.get("done")), len(units)), file=sys.stderr)
+    else:
+        units = [{
+            "i": i,
+            "kind": "keep" if len(s) <= SMALL_KEEP else "compress",
+            "text": s,
+            "out": "" if len(s) <= SMALL_KEEP else None,
+            "done": len(s) <= SMALL_KEEP,  # 小段原样，直接完成
+        } for i, s in enumerate(segs)]
+        save_state({"count": len(segs), "units": units, "src": src})
+        print("[ctxc] 分段完成：%d 段（保留 %d / 压缩 %d）" % (
+            len(segs),
+            sum(1 for u in units if u["kind"] == "keep"),
+            sum(1 for u in units if u["kind"] == "compress")), file=sys.stderr)
+
+    # ── 路由：压缩段按本地预算分配 ─────────────────────────
+    local_units, cloud_units, acc = [], [], 0
+    for u in units:
+        if u["kind"] != "compress" or u["done"]:
+            continue
+        if acc + len(u["text"]) <= LOCAL_MAX:
+            local_units.append(u)
+            acc += len(u["text"])
         else:
-            cloud_chunks.append(c)
+            cloud_units.append(u)
 
     cloud_api, cloud_key, cloud_model = resolve_cloud()
-    use_cloud = bool(cloud_chunks) and bool(cloud_api) and not args.no_hybrid
+    use_cloud = bool(cloud_units) and bool(cloud_api) and not args.no_hybrid
 
-    def run_local(cs):
-        out = []
-        for c in cs:
-            try:
-                out.append(call(LOCAL_API, "", LOCAL_MODEL, c))
-                print("[ctxc] 本地块完成 (%d 字)" % len(c), file=sys.stderr)
-            except Exception as e:
-                out.append("[本地压缩失败: %s] 原文见: %s" % (e, src))
-        return out
+    def unit_done(u, out):
+        u["out"] = out
+        u["done"] = True
+        save_state({"count": len(units), "units": units, "src": src})
 
-    def _cloud_models():
-        """候选模型：默认自动路由 + 网关模型列表（自动切换镜像）。"""
-        cands = [cloud_model] if cloud_model else []
-        try:
-            req = urllib.request.Request(
-                cloud_api.rsplit("/chat/completions", 1)[0] + "/models",
-                headers={"Authorization": "Bearer " + cloud_key} if cloud_key else {})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                j = json.loads(r.read().decode("utf-8"))
-            for m in j.get("data", []):
-                mid = m.get("id")
-                if mid and mid not in cands:
-                    cands.append(mid)
-        except Exception:
-            pass
-        return cands[:4]
-
-    def run_cloud(cs):
-        out = []
-        models = _cloud_models()
-        for c in cs:
-            done = False
-            for m in models:
-                try:
-                    out.append(call(cloud_api, cloud_key, m, c))
-                    print("[ctxc] 云端块完成 (%d 字, %s)" % (len(c), m), file=sys.stderr)
-                    done = True
-                    break
-                except Exception:
-                    continue
-            if not done:
-                out.append("[云端压缩失败（已试自动切换）] 原文见: %s" % src)
-        return out
+    def compress_unit(u, api, key, model, cap):
+        outs = []
+        for c in sub_chunk(u["text"], cap):
+            outs.append(call(api, key, model, c))
+        unit_done(u, "\n".join(outs))
+        return u["out"]
 
     t0 = time.time()
     if use_cloud:
-        # 并发：本地串行组 与 云端串行组 同时跑
+        def run_local():
+            for u in local_units:
+                compress_unit(u, LOCAL_API, "", LOCAL_MODEL, LOCAL_CHUNK)
+                print("[ctxc] 本地段完成 (%d 字)" % len(u["text"]), file=sys.stderr)
+        def run_cloud():
+            models = [cloud_model]
+            try:
+                req = urllib.request.Request(
+                    cloud_api.rsplit("/chat/completions", 1)[0] + "/models",
+                    headers={"Authorization": "Bearer " + cloud_key} if cloud_key else {})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    j = json.loads(r.read().decode("utf-8"))
+                for m in j.get("data", []):
+                    if m.get("id") and m["id"] not in models:
+                        models.append(m["id"])
+            except Exception:
+                pass
+            for u in cloud_units:
+                ok = False
+                for m in models[:4]:
+                    try:
+                        compress_unit(u, cloud_api, cloud_key, m, CLOUD_CHUNK)
+                        print("[ctxc] 云端段完成 (%d 字, %s)" % (len(u["text"]), m), file=sys.stderr)
+                        ok = True
+                        break
+                    except Exception:
+                        continue
+                if not ok:
+                    unit_done(u, "[云端压缩失败（已试自动切换）] 原文见: %s" % src)
         with ThreadPoolExecutor(max_workers=2) as ex:
-            f_local = ex.submit(run_local, local_chunks)
-            f_cloud = ex.submit(run_cloud, cloud_chunks)
-            local_out = f_local.result()
-            cloud_out = f_cloud.result()
+            f1 = ex.submit(run_local)
+            f2 = ex.submit(run_cloud)
+            f1.result()
+            f2.result()
     else:
-        local_out = run_local(local_chunks)
-        cloud_out = []
-        if cloud_chunks:
-            note = "（%d 块共 %d 字超出本地容量：云端端点未配置，原样保留）" % (
-                len(cloud_chunks), sum(len(c) for c in cloud_chunks))
-            cloud_out.append(note)
-            for c in cloud_chunks:
-                cloud_out.append("  · " + c.strip().replace("\n", " ")[:120] + ("…" if len(c) > 120 else ""))
+        for u in local_units:
+            compress_unit(u, LOCAL_API, "", LOCAL_MODEL, LOCAL_CHUNK)
+            print("[ctxc] 本地段完成 (%d 字)" % len(u["text"]), file=sys.stderr)
+        for u in cloud_units:
+            unit_done(u, "[超出本地容量，云端未配置] 原文见: %s\n%s" % (src, u["text"]))
 
+    # ── 输出 ──────────────────────────────────────────────
     if args.keep_paths:
         print("# 来源: %s" % src)
-    print("\n".join(local_out + cloud_out))
-    print("[ctxc] 完成：本地 %d 块 / 云端 %d 块，耗时 %.1fs" % (
-        len(local_chunks), len(cloud_chunks) if use_cloud else 0, time.time() - t0), file=sys.stderr)
+    for u in units:
+        if u["kind"] == "keep":
+            print("· " + u["text"].replace("\n", " ")[:200])
+        else:
+            print(u["out"] or "")
+    print("[ctxc] 完成：保留 %d / 本地 %d / 云端 %d，耗时 %.1fs（断点状态: %s）" % (
+        sum(1 for u in units if u["kind"] == "keep"),
+        len(local_units), len(cloud_units) if use_cloud else 0,
+        time.time() - t0, state_path), file=sys.stderr)
 
 if __name__ == "__main__":
     main()
