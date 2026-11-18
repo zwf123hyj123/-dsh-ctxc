@@ -41,7 +41,7 @@ dsh plugin --profile web add <本仓库目录>
 |---|---|---|
 | 「压一下」胶囊 | [lib/index.js](lib/index.js) | 手机 proot 实测版 local-ctxc 0.2.x，短文本地压、超长转当前对话云端压 |
 | 每轮自动会话卡 | [lib/index.js](lib/index.js)（turn.note 段） | 连续性卡体系：每轮原话样本滚动，2 分钟冷却、20MB 日志上限 |
-| 混合并发压缩 CLI | [scripts/ctxc.py](scripts/ctxc.py) | 本机 ctxc.py v3：断点续传 + 按功能/上下文分段（大段总结、小段原样）+ 本地 Ollama + 云端自动切换（ofm 网关 18326）并发 |
+| 压缩 CLI | [scripts/ctxc.py](scripts/ctxc.py) | 本机 ctxc.py v3：断点续传 + 按功能/上下文分段（大段总结、小段原样）+ 本地 Ollama |
 | 模型压缩方案 | [docs/compression-plan.md](docs/compression-plan.md) | 量化/蒸馏/剪枝/上下文压缩路线（实测口径见文内） |
 | 上下文压缩方案 | [docs/context-compression.md](docs/context-compression.md) | 预筛原则、分块硬约束、失败回退、实测数据 |
 | CI 检查 | [.github/workflows/ci.yml](.github/workflows/ci.yml) | 语法 + dshGo 清单校验（[validate.mjs](.github/scripts/validate.mjs)） |
