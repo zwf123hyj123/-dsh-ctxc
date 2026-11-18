@@ -13,6 +13,7 @@
   "engines": {
     "dsh": ">=0.2.1-rc.2 <0.3.0-0"
   },
+  "publishConfig": { "access": "public" },
   "dshGo": {
     "v": 1,
     "title": {
