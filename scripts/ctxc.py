@@ -41,14 +41,14 @@ SYSTEM = "你是上下文压缩器。把输入压缩成中文要点，每点不�
 
 def resolve_cloud():
     if CLOUD_API:
-        return CLOUD_API, CLOUD_KEY, CLOUD_MODEL or "kilo-auto/free"
+        return CLOUD_API, CLOUD_KEY, CLOUD_MODEL or "deepseek-official/deepseek-flash"
     try:
         j = json.load(open(OFM_SETTINGS))
         relay = j.get("chanGateway", {}).get("relay", {})
         if relay.get("enabled"):
             api = "http://%s:%s/v1/chat/completions" % (
                 relay.get("host", "127.0.0.1"), relay.get("port", 18326))
-            return api, relay.get("key", ""), CLOUD_MODEL or "kilo-auto/free"
+            return api, relay.get("key", ""), CLOUD_MODEL or "deepseek-official/deepseek-flash"
     except Exception:
         pass
     return "", "", ""
