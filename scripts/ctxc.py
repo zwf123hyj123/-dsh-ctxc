@@ -229,7 +229,9 @@ def main():
             cloud_units.append(u)
 
     cloud_api, cloud_key, cloud_model = resolve_cloud()
-    use_cloud = bool(cloud_units) and bool(cloud_api) and not args.no_hybrid
+    # 2026-11-25 修：原来 use_cloud 依赖 cloud_units（小输入全进 local → 云端不参与 → 纯本地 1.5B 慢死）
+    # 改为只看「云端是否可用」：可用就走云端，本地只做失败兜底。
+    use_cloud = bool(cloud_api) and not args.no_hybrid
 
     def unit_done(u, out):
         with LOCK:
@@ -290,11 +292,22 @@ def main():
             # 并发输入输出：云端组 W_CLOUD 工作线程
             with ThreadPoolExecutor(max_workers=max(1, W_CLOUD)) as cex:
                 list(cex.map(_cloud_one, cloud_units))
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f1 = ex.submit(run_local)
-            f2 = ex.submit(run_cloud)
-            f1.result()
-            f2.result()
+            # local_units 也先走云端（小段一次就完，避免本地 1.5B 拖死）
+            left_local = [u for u in local_units if not u.get("done")]
+            if left_local:
+                with ThreadPoolExecutor(max_workers=max(1, W_CLOUD)) as cex2:
+                    list(cex2.map(_cloud_one, left_local))
+        # 2026-11-25 改：原「双跑」→「全段云端优先 + 失败本地兜底」。
+        # 关键：local_units 也要先走云端——否则小段走本地 1.5B（30-60 秒/块），整体被拖死。
+        run_cloud()
+        still = [u for u in units if not u.get("done")]
+        if still:
+            print("[ctxc] 云端未完成 %d 段，转本地兜底" % len(still), file=sys.stderr)
+            with ThreadPoolExecutor(max_workers=max(1, W_LOCAL)) as lex:
+                def _fallback(u):
+                    compress_unit(u, LOCAL_API, "", LOCAL_MODEL, LOCAL_CHUNK)
+                    print("[ctxc] 本地兜底完成 (%d 字)" % len(u["text"]), file=sys.stderr)
+                list(lex.map(_fallback, still))
     else:
         with ThreadPoolExecutor(max_workers=max(1, W_LOCAL)) as lex:
             def _l2(u):
