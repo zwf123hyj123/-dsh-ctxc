@@ -38,6 +38,7 @@ GATEWAY_MODELS = [
 
 # ---------- 进程判据：必须在跑的常驻进程（pattern 用于 ps 匹配） ----------
 PROCESS_CHECKS = [
+    ('对话镜像常驻', '虚拟对话.py --watch'),
     ('虚拟引擎常驻', '虚拟引擎.py --watch'),
     ('Ollama 服务', 'ollama serve'),
 ]

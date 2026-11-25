@@ -61,9 +61,24 @@ def main():
         ok, detail = sg.check_gateway(model)
         add('模型·' + model.split('/')[-1], ok, detail if not ok else '')
 
-    # 5) 常驻进程（判据表）
+    # 5) 常驻进程（判据表）：缺了先自愈拉起，再复查（2026-11-25：App 重启后要能自己回来）
+    _missing = [n for n, pat in J.PROCESS_CHECKS if not proc_running(pat)]
+    if _missing:
+        try:
+            _kp = os.path.join(os.path.dirname(os.path.abspath(__file__)), '常驻保活.py')
+            r = subprocess.run(['python3', _kp], capture_output=True, text=True, timeout=120)
+            _launched = []
+            try:
+                _launched = json.loads((r.stdout or '{}').strip().splitlines()[-1]).get('已拉起') or []
+            except Exception:
+                _launched = []
+            add('常驻自愈', bool(_launched),
+                ('已拉起：' + ','.join(_launched)) if _launched else '缺失但未拉起（看保活日志）')
+        except Exception as e:
+            add('常驻自愈', False, '保活失败：' + str(e)[:60])
     for name, pattern in J.PROCESS_CHECKS:
-        add(name, proc_running(pattern), '')
+        _ok = proc_running(pattern)
+        add(name, _ok, '' if _ok else '缺失（可能刚被自愈拉起）')
 
     # 5.5) 浏览器与 keepalive（闲鱼值守依赖；keepalive 死了自动拉起）
     ok, code = probe(9333, '/json/version')
@@ -79,6 +94,27 @@ def main():
             add('keepalive', False, '拉起失败：' + str(e)[:40])
     else:
         add('keepalive', True, '')
+
+    # 5.6) 自启插件：引擎启动时把常驻带回（登记在 profile patch 里；执行证据在 /tmp/local-autostart.log）
+    _patch = os.path.join(os.path.expanduser('~'), '.dsh', 'profiles', 'web', 'cordis.patch.yml')
+    _reg = False
+    try:
+        _reg = 'local-autostart' in open(_patch, encoding='utf-8').read()
+    except OSError:
+        _reg = False
+    _ran = ''
+    try:
+        with open('/tmp/local-autostart.log', encoding='utf-8') as _f:
+            _lines = [x for x in _f if x.strip()]
+        _raw = _lines[-1].strip().split(' ')[0]  # ISO/UTC 写入，显示时转本地（92 轮同类教训）
+        import datetime as _dt
+        _ran = _dt.datetime.fromisoformat(_raw.replace('Z', '+00:00')) \
+            .astimezone().strftime('%m-%d %H:%M:%S')
+    except Exception:
+        _ran = ''
+    add('自启插件', _reg,
+        ('已登记·上次执行 ' + _ran) if (_reg and _ran) else
+        ('已登记·本引擎启动后还没执行过（下次重启会跑）' if _reg else '未登记（删了？）'))
 
     # 6) 模拟大脑层健康（八层里能自动判的几层）
     ARCH = '/root/workspace/记忆档案'
