@@ -242,7 +242,12 @@ def main():
     def compress_unit(u, api, key, model, cap):
         outs = []
         for c in sub_chunk(u["text"], cap):
-            outs.append(call(api, key, model, c))
+            try:
+                outs.append(call(api, key, model, c))
+            except Exception as e:
+                # 2026-11-25 修：单块失败不再炸穿整个压缩进程（曾因 urlopen 超时导致 ctxc 0字）
+                print("[ctxc] 压缩失败（%s），该块保留原文" % str(e)[:60], file=sys.stderr)
+                outs.append(c)
         out = "\n".join(outs)
         unit_done(u, out)
         # 写入共通点索引（auto/common 模式跨输入复用）

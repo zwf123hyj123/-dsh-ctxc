@@ -18,7 +18,7 @@
   # 检查网关某模型能出字（会发一次 hi）
   python3 state_guard.py check-gateway <model-id>
 """
-import sys, os, json, shutil, hashlib, tempfile, subprocess, urllib.request, time
+import sys, os, json, shutil, hashlib, tempfile, subprocess, urllib.request, urllib.error, time
 
 DSH_HOME = os.path.expanduser(os.environ.get('DSH_HOME', '~/.dsh'))
 SETTINGS = os.path.join(DSH_HOME, 'our-free-model', 'settings.json')
@@ -102,14 +102,32 @@ def check_gateway(model, timeout=25):
         'Authorization': 'Bearer ' + GW_KEY,
         'Content-Type': 'application/json',
     })
+    def _throttle(msg):
+        # 2026-11-25 修：免费额度用完/限流是可预期状态（如 chatanywhere 100次/24h），不算故障
+        return any(k in msg for k in ('额度', 'limit', 'quota', 'rate', '429'))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             data = json.loads(r.read().decode())
         if data.get('choices'):
             return True, 'ok'
-        return False, str(data.get('error', data))[:120]
+        err = str(data.get('error', data))[:120]
+        if _throttle(err):
+            return True, '限流（免费额度用完，可预期）'
+        return False, err
+    except urllib.error.HTTPError as e:
+        body = ''
+        try:
+            body = e.read().decode()[:300]
+        except Exception:
+            pass
+        if _throttle(body) or _throttle(str(e)):
+            return True, '限流（免费额度用完，可预期）'
+        return False, (str(e) + ' ' + body)[:150]
     except Exception as e:
-        return False, str(e)[:120]
+        msg = str(e)[:120]
+        if _throttle(msg):
+            return True, '限流（免费额度用完，可预期）'
+        return False, msg
 
 
 # 判据唯一来源：scripts/判据.py（模拟大脑突触层——一个判据，多处引用）
