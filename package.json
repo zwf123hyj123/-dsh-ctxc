@@ -1,6 +1,6 @@
 {
   "name": "dsh-ctxc",
-  "version": "0.2.2",
+  "version": "0.3.1",
   "description": "用本地 Ollama 小模型压缩上下文的 dsh-go 插件：输入框「压一下」胶囊 + 每轮对话后自动压缩滚进会话卡",
   "license": "MIT",
   "type": "module",
@@ -13,7 +13,9 @@
   "engines": {
     "dsh": ">=0.2.1-rc.2 <0.3.0-0"
   },
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "dshGo": {
     "v": 1,
     "title": {

@@ -106,6 +106,7 @@ def call(api, key, model, chunk, timeout=90):
         ],
         "max_tokens": 90,
         "stream": False,
+        "reasoning_effort": "none",
     }).encode("utf-8")
     req = urllib.request.Request(api, data=body, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -120,6 +121,8 @@ def main():
     ap.add_argument("--no-hybrid", action="store_true")
     ap.add_argument("--ckpt", choices=["auto", "module", "common"], default="auto",
                     help="断点法：module=模块断法（按输入独立）；common=上下通点（跨输入共通点复用）；auto=两者结合")
+    ap.add_argument("--keep-pattern", action="append", default=[],
+                    help="正则：匹配的段整体保留原文不压缩，可多次指定（如 --keep-pattern '^#.*规则'）")
     args = ap.parse_args()
 
     if args.file:
@@ -140,6 +143,7 @@ def main():
             return None
 
     def save_state(state):
+        state["keep_patterns"] = args.keep_pattern  # 锚定规则变化时强制重建断点
         tmp = state_path + ".tmp"
         json.dump(state, open(tmp, "w"), ensure_ascii=False)
         os.replace(tmp, state_path)
@@ -158,26 +162,43 @@ def main():
 
     # ── 建立/恢复单元列表（断点续传核心）────────────────────
     segs = segment(text)
+    keep_pats = []
+    for p in args.keep_pattern:
+        try:
+            keep_pats.append(re.compile(p))
+        except re.error:
+            print("[ctxc] 忽略非法 keep-pattern：%s" % p, file=sys.stderr)
+
+    def pinned(seg):
+        return any(pat.search(seg) for pat in keep_pats)
+
     state = None if args.fresh else load_state()
-    if state and state.get("units") is not None and state.get("count") == len(segs):
+    patterns_match = (state is not None) and ((state.get("keep_patterns") or []) == args.keep_pattern)
+    if state and patterns_match and state.get("units") is not None and state.get("count") == len(segs):
         units = state["units"]
         for u, s in zip(units, segs):
             u["text"] = s  # 以当前输入为准
         print("[ctxc] 断点续传：%d/%d 段已完成" % (
             sum(1 for u in units if u.get("done")), len(units)), file=sys.stderr)
     else:
-        units = [{
-            "i": i,
-            "kind": "keep" if len(s) <= SMALL_KEEP else "compress",
-            "text": s,
-            "out": "" if len(s) <= SMALL_KEEP else None,
-            "done": len(s) <= SMALL_KEEP,  # 小段原样，直接完成
-        } for i, s in enumerate(segs)]
+        units = []
+        for i, s in enumerate(segs):
+            pin = pinned(s)
+            keep = len(s) <= SMALL_KEEP or pin
+            units.append({
+                "i": i,
+                "kind": "keep" if keep else "compress",
+                "pinned": pin,
+                "text": s,
+                "out": "" if keep else None,
+                "done": keep,  # 小段或 keep-pattern 命中：原样，直接完成
+            })
         save_state({"count": len(segs), "units": units, "src": src})
-        print("[ctxc] 分段完成：%d 段（保留 %d / 压缩 %d）" % (
+        print("[ctxc] 分段完成：%d 段（保留 %d / 压缩 %d / 锚定 %d）" % (
             len(segs),
             sum(1 for u in units if u["kind"] == "keep"),
-            sum(1 for u in units if u["kind"] == "compress")), file=sys.stderr)
+            sum(1 for u in units if u["kind"] == "compress"),
+            sum(1 for u in units if u.get("pinned"))), file=sys.stderr)
 
     # ── 上下通点复用：跨输入共通段直接复用已压结果 ──────────
     reused = 0
@@ -290,7 +311,10 @@ def main():
         print("# 来源: %s" % src)
     for u in units:
         if u["kind"] == "keep":
-            print("· " + u["text"].replace("\n", " ")[:200])
+            if u.get("pinned"):
+                print(u["text"])  # 锚定段：完整原文，不截断（契约/规则原文）
+            else:
+                print("· " + u["text"].replace("\n", " ")[:200])
         else:
             print(u["out"] or "")
     elapsed = time.time() - t0
