@@ -20,6 +20,11 @@ TARGETS = [
      'out': '/tmp/虚拟对话-watch.log'},
     {'name': '虚拟引擎', 'match': '虚拟引擎.py --watch', 'cmd': ['python3', '虚拟引擎.py', '--watch'],
      'out': '/tmp/虚拟引擎-watch.log'},
+    # 2026-11-25：EigenFlux 接单守护（不常驻就不会自动派发真实订单）
+    {'name': 'EF接单', 'match': '--runtime-mode skill watch --dispatch',
+     'cmd': ['/root/.local/bin/eigenflux', '--homedir', '/root/.eigenflux', '--runtime-mode', 'skill',
+             'watch', '--dispatch'],
+     'out': '/tmp/ef-watch-dispatch.log'},
 ]
 
 

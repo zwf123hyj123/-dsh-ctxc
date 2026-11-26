@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""虚拟引擎（只读=对外部数据只读：会话/配置只 hash 或解压读；写只落 engine-standby/）
+
+虚拟引擎 · 只读热备（对应痛点方案 2 的完整版，维护者 2026-11-25 定调：只读不干活，挂了换一下）
+
+设计：
+- **只读**：只读主引擎的配置文件与状态（cordis.patch.yml / settings.json），算 hash 记录变化；
+  绝不写主引擎的任何文件、不接会话、不处理请求。
+- **不干活**：默认只做预检 + 健康探测 + 配置同步记录，CPU 占用接近 0。
+- **换一下**：探测到主引擎全挂（3080/18326 都不通）→ 用同一套启动命令拉起（切换）。
+
+用法：
+  python3 虚拟引擎.py --check     # 单次预检 + 探测 + 同步记录
+  python3 虚拟引擎.py --watch     # 常驻热备（30 秒一轮）
+  python3 虚拟引擎.py --dry       # 只看状态，不做任何动作
+"""
+import sys, os, json, time, hashlib, subprocess, urllib.request, urllib.error
+
+HOME = os.path.expanduser('~')
+DSH_HOME = os.environ.get('DSH_HOME') or os.path.join(HOME, '.dsh')
+PROFILE = os.environ.get('DSH_PROFILE') or 'web'
+CONFIG_FILES = [
+    os.path.join(DSH_HOME, 'profiles', PROFILE, 'cordis.patch.yml'),
+    os.path.join(DSH_HOME, 'our-free-model', 'settings.json'),
+    os.path.join(DSH_HOME, '.credentials.yaml'),
+]
+PORTS = [
+    ('dsh-web', 3080, '/'),
+    ('gateway', 18326, '/v1/models'),
+]
+LAUNCH = [
+    '/opt/node/bin/node', '--import=/opt/dsh-go/boot-cache.mjs',
+    '/opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js', 'web',
+    '--patch', '/etc/dsh-app/dsh-web.patch.yml',
+    '--patch', '/opt/dsh-app/speech.patch.yml',
+    '--patch', '/opt/dsh-app/auth/auth.patch.yml',
+    '--patch', '/opt/dsh-app/search.patch.yml',
+    '--patch', '/opt/dsh-app/phone/phone.patch.yml',
+    '--host', '127.0.0.1', '--port', '3080', '--no-open',
+]
+STATE_DIR = os.path.join(DSH_HOME, 'engine-standby')
+STATE_FILE = os.path.join(STATE_DIR, 'state.json')
+RESTART_REQ = os.path.join(STATE_DIR, 'restart.request.json')   # 重启请求队列（工具侧只写这里）
+LOG = '/tmp/engine-standby.log'
+INTERVAL = 30
+
+def log(msg):
+    line = time.strftime('%Y-%m-%d %H:%M:%S ') + msg + '\n'
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        open(LOG, 'a').write(line)
+    except Exception:
+        pass
+
+def sha(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+    except Exception:
+        return None
+
+def preflight():
+    """只读预检：配置文件在不在、能不能解析"""
+    problems = []
+    for p in CONFIG_FILES:
+        if not os.path.exists(p):
+            problems.append('缺文件: ' + p); continue
+        if p.endswith('.json'):
+            try: json.load(open(p))
+            except Exception as e: problems.append('JSON 解析失败: %s (%s)' % (p, str(e)[:60]))
+        elif p.endswith('.yml') or p.endswith('.yaml'):
+            r = subprocess.run(['python3','-c','import sys,yaml;yaml.safe_load(open(sys.argv[1]))', p],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                problems.append('YAML 解析失败: %s (%s)' % (p, (r.stderr or '').strip().split('\n')[-1][:60]))
+    return problems
+
+def sync_state():
+    """只读同步：记录配置 hash，变化只记录"""
+    try:
+        old = json.load(open(STATE_FILE))
+    except Exception:
+        old = {}
+    cur = {}
+    changed = []
+    for p in CONFIG_FILES:
+        h = sha(p)
+        cur[os.path.basename(p)] = h
+        if h and old.get(os.path.basename(p)) not in (None, h):
+            changed.append(os.path.basename(p))
+    state = {'at': int(time.time()), 'files': cur, 'changes': old.get('changes', []) + changed}
+    state['changes'] = state['changes'][-50:]
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        tmp = STATE_FILE + '.tmp'
+        json.dump(state, open(tmp, 'w'), ensure_ascii=False, indent=1)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log('state 写入失败: ' + str(e)[:80])
+    if changed:
+        log('配置变化: ' + ', '.join(changed))
+    return changed
+
+def probe():
+    out = []
+    for name, port, path in PORTS:
+        ok = False
+        try:
+            req = urllib.request.Request('http://127.0.0.1:%d%s' % (port, path),
+                                         headers={'Authorization': 'Bearer ofm-iVnqctXF-pb0Xf7jCUifSyjZtrrV9wtN'})
+            with urllib.request.urlopen(req, timeout=4) as r:
+                ok = r.status in (200, 401, 404, 405)
+        except urllib.error.HTTPError as e:
+            # 401/403 说明服务活着，只是要鉴权
+            ok = e.code in (200, 401, 403, 404, 405)
+        except Exception:
+            ok = False
+        out.append((name, port, ok))
+    return out
+
+def handover_note():
+    """切换前先落一份接续包（只读镜像 → handover-*.md），引擎挂了对话也不丢"""
+    try:
+        py = os.path.join(os.path.dirname(os.path.abspath(__file__)), '虚拟对话.py')
+        r = subprocess.run(['python3', py, '--once'], capture_output=True, text=True, timeout=180)
+        if r.returncode == 0:
+            subprocess.run(['python3', py, '--handover', '8'], capture_output=True, text=True, timeout=120)
+            log('接续包已生成（handover-*.md）')
+        else:
+            log('镜像同步失败: ' + (r.stderr or '')[:120])
+    except Exception as e:
+        log('接续包失败: ' + str(e)[:120])
+
+
+def autostart():
+    """把两个只读常驻（虚拟对话镜像 / 虚拟引擎热备）带回。幂等：已在跑就不动。
+    挂点：once() 每轮探测都调一次；引擎启动走的 cordis 插件也调同一个脚本。"""
+    try:
+        py = os.path.join(os.path.dirname(os.path.abspath(__file__)), '常驻保活.py')
+        r = subprocess.run(['python3', py], capture_output=True, text=True, timeout=150)
+        line = (r.stdout or '').strip().splitlines()[-1] if (r.stdout or '').strip() else '{}'
+        j = json.loads(line)
+        if j.get('已拉起'):
+            log('常驻补拉: ' + ','.join(j['已拉起']))
+        if j.get('错误'):
+            log('常驻错误: ' + str(j['错误'])[:120])
+        return j
+    except Exception as e:
+        log('常驻保活调用失败: ' + str(e)[:120])
+        return {}
+
+
+def switch(skip_handover=False):
+    """主引擎全挂 → 先落接续包，再用同一套配置拉起（切换）
+    skip_handover=True：调用方（热重启）刚刚已经落过，不重复生成。"""
+    log('主引擎全挂，虚拟引擎切换：拉起')
+    if not skip_handover:
+        handover_note()
+    port = listen_port()
+    if not wait_port_free(port, 40):
+        log('拉起前端口仍被占（%d），再等 10 秒' % port)
+        time.sleep(10)
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        out = open(os.path.join(STATE_DIR, 'launch.log'), 'ab')
+        subprocess.Popen(LAUNCH, stdout=out, stderr=out, start_new_session=True, close_fds=True)
+    except Exception as e:
+        log('拉起失败: ' + str(e)[:100]); return False
+    # 拉起后 8 秒内必须能看到主进程，否则说明它 bind 失败当场退了
+    if not wait_proc_alive():
+        log('拉起后 8 秒未见主进程，判定启动失败（多半 EADDRINUSE）')
+        time.sleep(2)
+        try:
+            out = open(os.path.join(STATE_DIR, 'launch.log'), 'ab')
+            subprocess.Popen(LAUNCH, stdout=out, stderr=out, start_new_session=True, close_fds=True)
+            log('已重试拉起一次')
+        except Exception as e:
+            log('重试拉起失败: ' + str(e)[:80])
+            return False
+    for _ in range(30):
+        time.sleep(2)
+        if any(ok for _, _, ok in probe()):
+            log('切换成功，主引擎已恢复')
+            ensure_local_model()
+            return True
+    log('切换失败（60 秒未就绪）')
+    ensure_local_model()
+    return False
+
+def listen_port():
+    """要守的端口：取 PORTS 里第一个（演练时会被 patch 成临时端口）"""
+    return PORTS[0][1]
+
+def port_free(port):
+    """端口上还有没有进程在 LISTEN。
+    HTTP probe 不通 ≠ 端口空闲（EADDRINUSE 事故）；而 bind 检测会被 TIME_WAIT 误判成占用，
+    所以直接读内核表：st == 0A 表示 LISTEN。（2026-11-27 两轮演练各踩一次）"""
+    hexport = '%04X' % int(port)
+    for f in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            for line in open(f).read().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                if parts[1].split(':')[-1].upper() == hexport and parts[3] == '0A':
+                    return False
+        except Exception:
+            pass
+    return True
+
+def _zombie(pid):
+    """proot 里子进程被杀后可能变僵尸，/proc/<pid> 仍在——僵尸等于已退出，端口已放"""
+    try:
+        st = open('/proc/%d/stat' % pid).read()
+        return st[st.rindex(')') + 2] == 'Z'
+    except Exception:
+        return True
+
+def wait_pids_gone(pids, timeout=30):
+    """等进程真正退出：/proc 消失 **或** 已是僵尸（2026-11-27 演练实测：只看 /proc 存在会白等 30 秒）"""
+    for _ in range(int(timeout * 2)):
+        if all(_zombie(int(p)) for p in pids):
+            return True
+        time.sleep(0.5)
+    return False
+
+def wait_port_free(port, timeout=40):
+    for _ in range(int(timeout * 2)):
+        if port_free(port):
+            return True
+        time.sleep(0.5)
+    return False
+
+def wait_proc_alive(expect_new=True, within=8):
+    """拉起后确认真有引擎活着（不是闪一下就退）"""
+    for _ in range(int(within * 2)):
+        time.sleep(0.5)
+        if find_main_pids():
+            return True
+    return False
+
+def find_main_pids():
+    """找到主引擎进程（bin.js web --port 3080）"""
+    pids = []
+    try:
+        out = subprocess.run(['ps', '-eo', 'pid,args'], capture_output=True, text=True, timeout=10).stdout
+        for line in out.splitlines():
+            if 'bin.js web' in line and '--port 3080' in line and 'grep' not in line:
+                pid = int(line.split()[0])
+                if pid != os.getpid():
+                    pids.append(pid)
+    except Exception:
+        pass
+    return pids
+
+def wait_ports_down(timeout=20):
+    for _ in range(timeout):
+        if not any(ok for _, _, ok in probe()):
+            return True
+        time.sleep(1)
+    return False
+
+def _cmdline(pid):
+    try:
+        return open('/proc/%d/cmdline' % pid, 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace')
+    except Exception:
+        return ''
+
+def _ppid(pid):
+    try:
+        st = open('/proc/%d/stat' % pid).read()
+        return int(st[st.rindex(')') + 2:].split()[1])
+    except Exception:
+        return 0
+
+def under_main_engine(depth=8):
+    """我（或近祖）是否由主引擎 spawn 出来的子进程。
+    是 → 就地热重启会把执行者自己一起杀掉（pty 会话随引擎死），后端永远执行不到。
+    2026-11-26 事故：工具 bash 的 ppid 就是主引擎 pid，SIGTERM 后 bash 连坐，端口一直空着。"""
+    pid = os.getppid()
+    for _ in range(depth):
+        if pid <= 1:
+            return False
+        cmd = _cmdline(pid)
+        if 'bin.js' in cmd and ' web' in cmd:
+            return True
+        pid = _ppid(pid)
+    return False
+
+def chain_names(depth=5):
+    """父链名字，写进请求里当证据（谁提交的）"""
+    out, pid = [], os.getppid()
+    for _ in range(depth):
+        if pid <= 1:
+            break
+        out.append((_cmdline(pid) or '?').strip()[:60])
+        pid = _ppid(pid)
+    return out
+
+def request_restart(reason='', by='tool'):
+    """只提交请求、不杀进程：留给独立会话的 --watch 下一轮执行。
+    独立会话（cordis 插件 spawn / setsid）不随主引擎死，所以拉起那半边一定跑得到。"""
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    data = {'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'reason': (reason or '')[:200],
+            'by': by, 'pid': os.getpid(), 'chain': chain_names(),
+            'under_main_engine': under_main_engine()}
+    tmp = RESTART_REQ + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, RESTART_REQ)          # 原子落位，读方不会看到半个 JSON
+    log('重启请求已提交: ' + ((reason or '-')[:80]) + ' by=' + by)
+    print('已提交重启请求（由独立守护者执行，不断这一轮）: ' + ((reason or '-')[:60]), flush=True)
+    return data
+
+def take_request():
+    """原子取走请求（重命名后再读），两个消费者不会抢同一单"""
+    if not os.path.exists(RESTART_REQ):
+        return None
+    run = RESTART_REQ + '.running'
+    try:
+        os.replace(RESTART_REQ, run)
+    except Exception:
+        return None
+    try:
+        with open(run, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        log('重启请求解析失败: ' + str(e)[:100])
+        data = {'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'reason': '解析失败，原样执行', 'by': 'queue'}
+    try:
+        os.remove(run)
+    except Exception:
+        pass
+    return data
+
+def proc_age_seconds(pid):
+    """进程已运行多少秒（/proc/<pid>/stat 第22字段 starttime ÷ 时钟频率，配合 /proc/uptime）"""
+    try:
+        st = open('/proc/%d/stat' % pid).read()
+        f = st[st.rindex(')') + 2:].split()
+        start = float(f[19]) / os.sysconf('SC_CLK_TCK')
+        up = float(open('/proc/uptime').read().split()[0])
+        return max(0.0, up - start)
+    except Exception:
+        return None
+
+def _running(pat):
+    try:
+        r = subprocess.run(['pgrep', '-f', pat], capture_output=True, text=True, timeout=8)
+        return [int(x) for x in (r.stdout or '').split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+def verify_system():
+    """重启后自验（也可单跑 --verify）：端口 / 引擎 pid / 常驻三进程 / patch 是否已被引擎加载 / 队列积压"""
+    now = time.time()
+    states = probe()
+    pids = find_main_pids()
+    patch_mtime = None
+    try:
+        patch_mtime = os.path.getmtime(CONFIG_FILES[0])
+    except Exception:
+        pass
+    engine_started_at = None
+    if pids:
+        age = proc_age_seconds(pids[0])
+        if age is not None:
+            engine_started_at = now - age
+    patch_loaded = None
+    if engine_started_at and patch_mtime:
+        # 引擎启动晚于配置修改 = 配置已被加载；早于 = 改了还没生效
+        patch_loaded = engine_started_at >= patch_mtime
+    last = None
+    try:
+        with open(os.path.join(STATE_DIR, 'last-restart.json'), encoding='utf-8') as f:
+            last = json.load(f)
+    except Exception:
+        pass
+    checks = {
+        '时间': time.strftime('%Y-%m-%d %H:%M:%S'),
+        '端口通': any(ok for _, _, ok in states),
+        '端口明细': {'%s:%d' % (n, p): ok for n, p, ok in states},
+        '引擎pid': pids,
+        '常驻': {'虚拟对话': _running('虚拟对话.py --watch'),
+                 '虚拟引擎': _running('虚拟引擎.py --watch'),
+                 'EF接单': _running('watch --dispatch')},
+        'patch已加载': patch_loaded,
+        'patch_mtime': (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(patch_mtime)) if patch_mtime else None),
+        '引擎启动于': (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(engine_started_at)) if engine_started_at else None),
+        '重启请求积压': os.path.exists(RESTART_REQ),
+        '上次重启': last,
+    }
+    bad = [k for k, v in [('端口不通', not checks['端口通']), ('无引擎进程', not pids),
+                          ('请求积压', checks['重启请求积压'])] if v]
+    if bad:
+        checks['结论'] = '异常：' + ','.join(bad)
+    elif patch_loaded is False:
+        checks['结论'] = '在跑，但配置改过还没加载（需重启才生效）'
+    else:
+        checks['结论'] = '正常'
+    return checks
+
+def hot_restart():
+    """热重启：预检 → 优雅停主引擎 → 等端口释放 → 立即拉起 → 等就绪"""
+    problems = preflight()
+    if problems:
+        log('热重启中止：预检失败 -> ' + '; '.join(problems))
+        print('预检失败，拒绝重启: ' + '; '.join(problems), flush=True)
+        return False
+    pids = find_main_pids()
+    if not pids:
+        log('主引擎不在，直接拉起')
+        return switch()
+    handover_note()  # 杀之前先落一份只读镜像与接续包，热重启也不丢对话
+    log('热重启：优雅停止主引擎 pids=%s' % pids)
+    import signal
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception as e:
+            log('停止 %d 失败: %s' % (pid, str(e)[:60]))
+    if not wait_pids_gone(pids, 30):
+        log('热重启失败：进程 30 秒未退出（pids=%s）' % pids)
+        print('旧引擎未退出，重启中止（未强杀）', flush=True)
+        return False
+    log('旧进程已退出，等端口真实空闲')
+    if not wait_port_free(listen_port(), 30):
+        log('热重启失败：端口 30 秒仍被占')
+        print('端口仍被占用，重启中止', flush=True)
+        return False
+    log('端口已释放，拉起新引擎')
+    t0 = time.time()
+    ok = switch(skip_handover=True)
+    ensure_local_model()
+    took = round(time.time() - t0, 1)
+    try:
+        checks = verify_system()
+        with open(os.path.join(STATE_DIR, 'last-restart.json'), 'w', encoding='utf-8') as f:
+            json.dump({'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'ok': ok,
+                       'seconds': took, 'engine_pids': find_main_pids(),
+                       'checks': checks}, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+    print('热重启' + ('成功' if ok else '失败') + ' · 用时 %ss' % took, flush=True)
+    return ok
+
+def probe_ollama():
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:11436/api/version', timeout=4) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+def ensure_local_model():
+    """热重启/切换后确保本地模型（ollama）活着——回切时它常被连带清掉"""
+    if probe_ollama():
+        return True
+    log('本地模型不在，拉起 ollama')
+    env = os.environ.copy()
+    env.update({
+        'OLLAMA_HOST': '127.0.0.1:11436',
+        'OLLAMA_MODELS': os.path.expanduser('~/.ollama/models'),
+        'OLLAMA_KEEP_ALIVE': '5m',
+        'OLLAMA_NUM_PARALLEL': '1',
+        'OLLAMA_MAX_LOADED_MODELS': '1',
+        'OLLAMA_CONTEXT_LENGTH': '4096',
+    })
+    try:
+        out = open('/tmp/ollama-serve.log', 'ab')
+        subprocess.Popen(['/opt/ollama/bin/ollama', 'serve'], env=env, stdout=out, stderr=out,
+                         start_new_session=True, close_fds=True)
+    except Exception as e:
+        log('ollama 启动失败: ' + str(e)[:100]); return False
+    for _ in range(15):
+        time.sleep(2)
+        if probe_ollama():
+            log('ollama 已拉起')
+            return True
+    log('ollama 拉起失败（30 秒未就绪）')
+    return False
+
+def audit():
+    """只读边界自审：哪些路径会写、哪些绝对不写。把「只读」从说法变成可查。"""
+    own = [STATE_FILE, LOG, os.path.join(STATE_DIR, 'last-restart.json')]
+    indirect = [os.path.join(DSH_HOME, 'engine-standby', 'dialog-mirror'),
+                os.path.join(DSH_HOME, 'engine-standby', 'handover-*.md')]
+    never = [os.path.join(DSH_HOME, 'sessions'), os.path.join(DSH_HOME, 'profiles'),
+             os.path.join(DSH_HOME, '.credentials.yaml'), os.path.join(DSH_HOME, 'skills')]
+    def under(p, roots):
+        p = os.path.abspath(p)
+        return any(p == r or p.startswith(r + os.sep) for r in roots)
+    bad = [p for p in own if under(p, never)]
+    reads_only = [p for p in CONFIG_FILES if not os.path.exists(p) or True]  # 一律只 sha，不写
+    print(json.dumps({
+        '会写': own + indirect,
+        '只读': ['sessions/**/session.v4.jsonl.zstd（仅 zstd -dc 解压读取）',
+                 'profiles/web/cordis.patch.yml（只 hash）',
+                 '/etc/dsh-app/*.patch.yml（只 hash）'],
+        '绝不写': never,
+        '越界': bad,
+        '结论': '边界成立：对外部数据只读，写只落在自己的运行目录' if not bad else '越界：' + ','.join(bad),
+    }, ensure_ascii=False, indent=1))
+    return 0 if not bad else 2
+
+
+def once(dry=False):
+    req = take_request()
+    if req:
+        if os.environ.get('RESTART_DRYRUN') == '1':
+            print('发现重启请求（DRYRUN 不执行）: ' + json.dumps(req, ensure_ascii=False)[:200])
+            log('DRYRUN 跳过重启请求: ' + json.dumps(req, ensure_ascii=False)[:120])
+        elif dry:
+            # dry 模式不放回队列会丢单，写回再跳过
+            try:
+                os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+                with open(RESTART_REQ, 'w', encoding='utf-8') as f:
+                    json.dump(req, f, ensure_ascii=False, indent=1)
+            except Exception:
+                pass
+            print('发现重启请求（dry 模式写回队列，不执行）')
+        else:
+            log('消费重启请求（本进程独立于主引擎）: ' + json.dumps(req, ensure_ascii=False)[:160])
+            hot_restart()
+    problems = preflight()
+    states = probe()
+    changed = sync_state()
+    alive = any(ok for _, _, ok in states)
+    print('预检: ' + ('OK' if not problems else '; '.join(problems)))
+    print('探测: ' + ', '.join('%s:%d%s' % (n, p, '✓' if ok else '✗') for n, p, ok in states))
+    print('配置同步: ' + ('变化 %s' % ', '.join(changed) if changed else '无变化'))
+    autostart()
+    if alive:
+        ensure_local_model()
+        print('结论: 主引擎在跑，虚拟引擎待命（只读）')
+        return True
+    if dry:
+        print('结论: 主引擎全挂（dry 模式不切换）')
+        return False
+    return switch()
+
+def main():
+    args = sys.argv[1:]
+    if '--request-restart' in args:
+        i = args.index('--request-restart')
+        reason = args[i + 1] if len(args) > i + 1 and not args[i + 1].startswith('-') else ''
+        request_restart(reason, by='tool')
+        return
+    if '--hot-restart' in args:
+        if under_main_engine():
+            # 自保：我就是主引擎的子进程，就地杀 = 连坐（2026-11-26 事故根因）
+            request_restart('--hot-restart 来自主引擎进程树，改由独立守护者执行', by='tool-fallback')
+            print('检测到执行者属于主引擎进程树：只提交请求，不就地重启', flush=True)
+            return
+        ok = hot_restart()
+        print('热重启' + ('成功' if ok else '失败'))
+        return
+    if '--verify' in args:
+        print(json.dumps(verify_system(), ensure_ascii=False, indent=1)); return
+    if '--check' in args or not args:
+        once(dry=False); return
+    if '--audit' in args:
+        return audit()
+    if '--dry' in args:
+        once(dry=True); return
+    if '--watch' in args:
+        log('虚拟引擎启动（只读热备，%d 秒一轮）' % INTERVAL)
+        while True:
+            try:
+                once(dry=False)
+            except Exception as e:
+                log('轮次异常: ' + str(e)[:120])
+            time.sleep(INTERVAL)
+
+if __name__ == '__main__':
+    main()

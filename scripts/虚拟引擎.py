@@ -41,6 +41,7 @@ LAUNCH = [
 ]
 STATE_DIR = os.path.join(DSH_HOME, 'engine-standby')
 STATE_FILE = os.path.join(STATE_DIR, 'state.json')
+RESTART_REQ = os.path.join(STATE_DIR, 'restart.request.json')   # 重启请求队列（工具侧只写这里）
 LOG = '/tmp/engine-standby.log'
 INTERVAL = 30
 
@@ -159,12 +160,27 @@ def switch(skip_handover=False):
     log('主引擎全挂，虚拟引擎切换：拉起')
     if not skip_handover:
         handover_note()
+    port = listen_port()
+    if not wait_port_free(port, 40):
+        log('拉起前端口仍被占（%d），再等 10 秒' % port)
+        time.sleep(10)
     try:
         os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
         out = open(os.path.join(STATE_DIR, 'launch.log'), 'ab')
         subprocess.Popen(LAUNCH, stdout=out, stderr=out, start_new_session=True, close_fds=True)
     except Exception as e:
         log('拉起失败: ' + str(e)[:100]); return False
+    # 拉起后 8 秒内必须能看到主进程，否则说明它 bind 失败当场退了
+    if not wait_proc_alive():
+        log('拉起后 30 秒未见主进程，判定启动失败（多半 EADDRINUSE）')
+        time.sleep(2)
+        try:
+            out = open(os.path.join(STATE_DIR, 'launch.log'), 'ab')
+            subprocess.Popen(LAUNCH, stdout=out, stderr=out, start_new_session=True, close_fds=True)
+            log('已重试拉起一次')
+        except Exception as e:
+            log('重试拉起失败: ' + str(e)[:80])
+            return False
     for _ in range(30):
         time.sleep(2)
         if any(ok for _, _, ok in probe()):
@@ -173,6 +189,59 @@ def switch(skip_handover=False):
             return True
     log('切换失败（60 秒未就绪）')
     ensure_local_model()
+    return False
+
+def listen_port():
+    """要守的端口：取 PORTS 里第一个（演练时会被 patch 成临时端口）"""
+    return PORTS[0][1]
+
+def port_busy(port):
+    """端口上有没有活着的服务：用真 HTTP 连接（curl）判，比读内核表可靠。
+    2026-11-27 三次踩坑记录：①HTTP probe 不通 ≠ 端口空闲（EADDRINUSE）②bind 检测被 TIME_WAIT 误判
+    ③读 /proc/net/tcp 的 LISTEN 表在 3099 上给出假「没监听」（候选引擎明明打印了 URL）。
+    统一成一个判据：curl 连得上 = 有人在听。"""
+    try:
+        r = subprocess.run(['curl', '-s', '-o', '/dev/null', '-m', '3',
+                            '-w', '%{http_code}', 'http://127.0.0.1:%d/' % int(port)],
+                           capture_output=True, text=True, timeout=8)
+        code = (r.stdout or '').strip()
+        return bool(code) and code != '000'
+    except Exception:
+        return False
+
+def port_free(port):
+    """端口空闲 = 连不上"""
+    return not port_busy(port)
+
+def _zombie(pid):
+    """proot 里子进程被杀后可能变僵尸，/proc/<pid> 仍在——僵尸等于已退出，端口已放"""
+    try:
+        st = open('/proc/%d/stat' % pid).read()
+        return st[st.rindex(')') + 2] == 'Z'
+    except Exception:
+        return True
+
+def wait_pids_gone(pids, timeout=30):
+    """等进程真正退出：/proc 消失 **或** 已是僵尸（2026-11-27 演练实测：只看 /proc 存在会白等 30 秒）"""
+    for _ in range(int(timeout * 2)):
+        if all(_zombie(int(p)) for p in pids):
+            return True
+        time.sleep(0.5)
+    return False
+
+def wait_port_free(port, timeout=40):
+    for _ in range(int(timeout * 2)):
+        if port_free(port):
+            return True
+        time.sleep(0.5)
+    return False
+
+def wait_proc_alive(expect_new=True, within=30):
+    """拉起后确认真有引擎活着（不是闪一下就退）"""
+    for _ in range(int(within * 2)):
+        time.sleep(0.5)
+        if find_main_pids():
+            return True
     return False
 
 def find_main_pids():
@@ -196,6 +265,258 @@ def wait_ports_down(timeout=20):
         time.sleep(1)
     return False
 
+def _cmdline(pid):
+    try:
+        return open('/proc/%d/cmdline' % pid, 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace')
+    except Exception:
+        return ''
+
+def _ppid(pid):
+    try:
+        st = open('/proc/%d/stat' % pid).read()
+        return int(st[st.rindex(')') + 2:].split()[1])
+    except Exception:
+        return 0
+
+def under_main_engine(depth=8):
+    """我（或近祖）是否由主引擎 spawn 出来的子进程。
+    是 → 就地热重启会把执行者自己一起杀掉（pty 会话随引擎死），后端永远执行不到。
+    2026-11-26 事故：工具 bash 的 ppid 就是主引擎 pid，SIGTERM 后 bash 连坐，端口一直空着。"""
+    pid = os.getppid()
+    for _ in range(depth):
+        if pid <= 1:
+            return False
+        cmd = _cmdline(pid)
+        if 'bin.js' in cmd and ' web' in cmd:
+            return True
+        pid = _ppid(pid)
+    return False
+
+def chain_names(depth=5):
+    """父链名字，写进请求里当证据（谁提交的）"""
+    out, pid = [], os.getppid()
+    for _ in range(depth):
+        if pid <= 1:
+            break
+        out.append((_cmdline(pid) or '?').strip()[:60])
+        pid = _ppid(pid)
+    return out
+
+def request_restart(reason='', by='tool'):
+    """只提交请求、不杀进程：留给独立会话的 --watch 下一轮执行。
+    独立会话（cordis 插件 spawn / setsid）不随主引擎死，所以拉起那半边一定跑得到。"""
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    data = {'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'reason': (reason or '')[:200],
+            'by': by, 'pid': os.getpid(), 'chain': chain_names(),
+            'under_main_engine': under_main_engine()}
+    tmp = RESTART_REQ + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, RESTART_REQ)          # 原子落位，读方不会看到半个 JSON
+    log('重启请求已提交: ' + ((reason or '-')[:80]) + ' by=' + by)
+    print('已提交重启请求（由独立守护者执行，不断这一轮）: ' + ((reason or '-')[:60]), flush=True)
+    return data
+
+def take_request():
+    """原子取走请求（重命名后再读），两个消费者不会抢同一单"""
+    if not os.path.exists(RESTART_REQ):
+        return None
+    run = RESTART_REQ + '.running'
+    try:
+        os.replace(RESTART_REQ, run)
+    except Exception:
+        return None
+    try:
+        with open(run, encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        log('重启请求解析失败: ' + str(e)[:100])
+        data = {'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'reason': '解析失败，原样执行', 'by': 'queue'}
+    try:
+        os.remove(run)
+    except Exception:
+        pass
+    return data
+
+def proc_age_seconds(pid):
+    """进程已运行多少秒（/proc/<pid>/stat 第22字段 starttime ÷ 时钟频率，配合 /proc/uptime）"""
+    try:
+        st = open('/proc/%d/stat' % pid).read()
+        f = st[st.rindex(')') + 2:].split()
+        start = float(f[19]) / os.sysconf('SC_CLK_TCK')
+        up = float(open('/proc/uptime').read().split()[0])
+        return max(0.0, up - start)
+    except Exception:
+        return None
+
+def _running(pat):
+    try:
+        r = subprocess.run(['pgrep', '-f', pat], capture_output=True, text=True, timeout=8)
+        return [int(x) for x in (r.stdout or '').split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+def verify_system():
+    """重启后自验（也可单跑 --verify）：端口 / 引擎 pid / 常驻三进程 / patch 是否已被引擎加载 / 队列积压"""
+    now = time.time()
+    states = probe()
+    pids = find_main_pids()
+    patch_mtime = None
+    try:
+        patch_mtime = os.path.getmtime(CONFIG_FILES[0])
+    except Exception:
+        pass
+    engine_started_at = None
+    if pids:
+        age = proc_age_seconds(pids[0])
+        if age is not None:
+            engine_started_at = now - age
+    patch_loaded = None
+    if engine_started_at and patch_mtime:
+        # 2026-11-27 修（判断 88：写与读口径要一致）：原先只比 mtime，脚本重写同一份内容也会被判「改了没加载」。
+        # 改成：优先比内容 sha256 与「上次记录为已加载」的基线；基线不存在时退回 mtime 判定并顺手写基线。
+        try:
+            import hashlib
+            _h = hashlib.sha256(open(CONFIG_FILES[0], 'rb').read()).hexdigest()[:16]
+        except Exception:
+            _h = None
+        _base_path = os.path.join(STATE_DIR, 'patch.loaded.sha256')
+        _base = None
+        try:
+            with open(_base_path, encoding='utf-8') as _f:
+                _base = _f.read().strip()
+        except Exception:
+            _base = None
+        if _h and _base:
+            patch_loaded = (_h == _base)          # 内容没变 → 视为已加载（不看 mtime）
+        else:
+            patch_loaded = engine_started_at >= patch_mtime
+            if _h:
+                try:
+                    os.makedirs(STATE_DIR, exist_ok=True)
+                    with open(_base_path, 'w', encoding='utf-8') as _f:
+                        _f.write(_h)
+                except Exception:
+                    pass
+    last = None
+    try:
+        with open(os.path.join(STATE_DIR, 'last-restart.json'), encoding='utf-8') as f:
+            last = json.load(f)
+    except Exception:
+        pass
+    checks = {
+        '时间': time.strftime('%Y-%m-%d %H:%M:%S'),
+        '端口通': any(ok for _, _, ok in states),
+        '端口明细': {'%s:%d' % (n, p): ok for n, p, ok in states},
+        '引擎pid': pids,
+        '常驻': {'虚拟对话': _running('虚拟对话.py --watch'),
+                 '虚拟引擎': _running('虚拟引擎.py --watch'),
+                 'EF接单': _running('watch --dispatch')},
+        'patch已加载': patch_loaded,
+        'patch_mtime': (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(patch_mtime)) if patch_mtime else None),
+        '引擎启动于': (time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(engine_started_at)) if engine_started_at else None),
+        '重启请求积压': os.path.exists(RESTART_REQ),
+        '上次重启': last,
+    }
+    bad = [k for k, v in [('端口不通', not checks['端口通']), ('无引擎进程', not pids),
+                          ('请求积压', checks['重启请求积压'])] if v]
+    if bad:
+        checks['结论'] = '异常：' + ','.join(bad)
+    elif patch_loaded is False:
+        checks['结论'] = '在跑，但配置改过还没加载（需重启才生效）'
+    else:
+        checks['结论'] = '正常'
+    return checks
+
+def _preview_port():
+    """候选槽端口：生产端口 +19（3080 → 3099），演练时跟着 PORTS 走"""
+    return int(listen_port()) + 19
+
+def _config_changed_recently(window=1800):
+    """生产配置近 window 秒内动过吗（bundles/patch）——动过才值得花 60 秒做 A/B 预验证"""
+    now = time.time()
+    paths = [CONFIG_FILES[0], os.path.join(DSH_HOME, 'profiles', PROFILE, 'package.json')]
+    for p in paths:
+        try:
+            if now - os.path.getmtime(p) < window:
+                return True
+        except Exception:
+            pass
+    return False
+
+def preview_launch(timeout=60):
+    """A/B 预验证（安卓恢复模式：先验证再切换，绝不先杀后赌）。
+    在候选端口用**同一套启动参数**拉一个候选引擎：它能进入监听，说明这套配置（bundles/patch）加载得起来。
+    验证完立刻杀掉候选，全程不碰生产端口。"""
+    port = _preview_port()
+    if not port_free(port):
+        return False, '候选端口 %d 已被占用' % port
+    args, skip = [], False
+    for a in LAUNCH:
+        if skip:
+            args.append(str(port)); skip = False; continue
+        args.append(a)
+        if str(a) == '--port':
+            skip = True
+    if not skip and str(port) not in args:
+        args += ['--port', str(port)]        # 兜底：原命令没有 --port 时补上
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        out = open(os.path.join(STATE_DIR, 'preview.log'), 'ab')
+        p = subprocess.Popen(args, stdout=out, stderr=out, start_new_session=True, close_fds=True)
+    except Exception as e:
+        return False, '候选拉起失败: %s' % str(e)[:80]
+    ok, why = False, '候选 %d 秒内未进入监听（引擎冷启动约 30-40 秒）' % timeout
+    for _ in range(int(timeout * 2)):
+        time.sleep(0.5)
+        if p.poll() is not None:
+            why = '候选进程已退出（exit=%s）：配置或端口有问题' % p.returncode
+            break
+        if port_busy(port):
+            ok, why = True, ''
+            break
+    try:
+        p.terminate()
+        for _ in range(10):
+            if p.poll() is not None:
+                break
+            time.sleep(0.3)
+        else:
+            p.kill()
+    except Exception:
+        pass
+    if ok:
+        log('A/B 预验证通过（候选端口 %d 已监听）' % port)
+    else:
+        log('A/B 预验证失败：' + why)
+    return ok, why
+
+def spawn_watchdog():
+    """把看门狗放出去：最小依赖的 sh，主引擎死了它还在。
+    位置：kill 主引擎**之前**——它 sleep 20 秒后若发现无人监听 3080，自己拉一次。"""
+    wd = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'watchdog.sh')
+    if not os.path.exists(wd):
+        log('看门狗脚本不存在，跳过')
+        return False
+    try:
+        devnull = open(os.devnull, 'rb')
+        out = open('/tmp/watchdog-spawn.log', 'ab')
+        subprocess.Popen(['sh', wd], cwd=os.path.dirname(wd),
+                         stdin=devnull, stdout=out, stderr=subprocess.STDOUT,
+                         start_new_session=True, close_fds=True)
+        log('看门狗已放出（20 秒后若无人监听会自动兜底）')
+        return True
+    except Exception as e:
+        log('看门狗放出失败: ' + str(e)[:80])
+        return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠ 2026-11-27 定论（判断库 109）：这台机器的 proot 里，引擎退出会清掉整个进程树，
+#   连 ppid=1 的孤儿都不放过（探针实测只写 2 行即断）。所以「自内向外热重启」在这里
+#   不可能成功——下面的 hot_restart / watchdog / 预验证都只在「有人能在外部拉起引擎」
+#   的前提下才有意义。默认不要在生产上调用；真要重启，请由人手动重开 App/工作区。
+#   要做真自愈，前提是 proot 之外有监督者（Android 原生 supervisor / Shizuku / ADB）。
+# ─────────────────────────────────────────────────────────────────────────────
 def hot_restart():
     """热重启：预检 → 优雅停主引擎 → 等端口释放 → 立即拉起 → 等就绪"""
     problems = preflight()
@@ -203,10 +524,21 @@ def hot_restart():
         log('热重启中止：预检失败 -> ' + '; '.join(problems))
         print('预检失败，拒绝重启: ' + '; '.join(problems), flush=True)
         return False
+    # A/B 预验证属于「花钱买保险」：只在配置刚变过（或显式要求）时才跑，平时省 60 秒
+    need_prev = ('--preview' in sys.argv) or _config_changed_recently()
+    if need_prev:
+        ok_prev, why_prev = preview_launch()
+        if not ok_prev:
+            log('热重启中止（A/B 预验证未过）：' + why_prev)
+            print('预验证未通过，主引擎未动：' + why_prev, flush=True)
+            return False
+    else:
+        log('跳过 A/B 预验证（配置近 30 分钟没变）')
     pids = find_main_pids()
     if not pids:
         log('主引擎不在，直接拉起')
         return switch()
+    spawn_watchdog()
     handover_note()  # 杀之前先落一份只读镜像与接续包，热重启也不丢对话
     log('热重启：优雅停止主引擎 pids=%s' % pids)
     import signal
@@ -215,9 +547,14 @@ def hot_restart():
             os.kill(pid, signal.SIGTERM)
         except Exception as e:
             log('停止 %d 失败: %s' % (pid, str(e)[:60]))
-    if not wait_ports_down(20):
-        log('热重启失败：端口 20 秒未释放')
-        print('端口未释放，重启失败（未强杀）', flush=True)
+    if not wait_pids_gone(pids, 30):
+        log('热重启失败：进程 30 秒未退出（pids=%s）' % pids)
+        print('旧引擎未退出，重启中止（未强杀）', flush=True)
+        return False
+    log('旧进程已退出，等端口真实空闲')
+    if not wait_port_free(listen_port(), 30):
+        log('热重启失败：端口 30 秒仍被占')
+        print('端口仍被占用，重启中止', flush=True)
         return False
     log('端口已释放，拉起新引擎')
     t0 = time.time()
@@ -225,9 +562,11 @@ def hot_restart():
     ensure_local_model()
     took = round(time.time() - t0, 1)
     try:
+        checks = verify_system()
         with open(os.path.join(STATE_DIR, 'last-restart.json'), 'w', encoding='utf-8') as f:
             json.dump({'at': time.strftime('%Y-%m-%d %H:%M:%S'), 'ok': ok,
-                       'seconds': took, 'engine_pids': find_main_pids()}, f, ensure_ascii=False)
+                       'seconds': took, 'engine_pids': find_main_pids(),
+                       'checks': checks}, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
     print('热重启' + ('成功' if ok else '失败') + ' · 用时 %ss' % took, flush=True)
@@ -293,6 +632,23 @@ def audit():
 
 
 def once(dry=False):
+    req = take_request()
+    if req:
+        if os.environ.get('RESTART_DRYRUN') == '1':
+            print('发现重启请求（DRYRUN 不执行）: ' + json.dumps(req, ensure_ascii=False)[:200])
+            log('DRYRUN 跳过重启请求: ' + json.dumps(req, ensure_ascii=False)[:120])
+        elif dry:
+            # dry 模式不放回队列会丢单，写回再跳过
+            try:
+                os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+                with open(RESTART_REQ, 'w', encoding='utf-8') as f:
+                    json.dump(req, f, ensure_ascii=False, indent=1)
+            except Exception:
+                pass
+            print('发现重启请求（dry 模式写回队列，不执行）')
+        else:
+            log('消费重启请求（本进程独立于主引擎）: ' + json.dumps(req, ensure_ascii=False)[:160])
+            hot_restart()
     problems = preflight()
     states = probe()
     changed = sync_state()
@@ -312,10 +668,22 @@ def once(dry=False):
 
 def main():
     args = sys.argv[1:]
+    if '--request-restart' in args:
+        i = args.index('--request-restart')
+        reason = args[i + 1] if len(args) > i + 1 and not args[i + 1].startswith('-') else ''
+        request_restart(reason, by='tool')
+        return
     if '--hot-restart' in args:
+        if under_main_engine():
+            # 自保：我就是主引擎的子进程，就地杀 = 连坐（2026-11-26 事故根因）
+            request_restart('--hot-restart 来自主引擎进程树，改由独立守护者执行', by='tool-fallback')
+            print('检测到执行者属于主引擎进程树：只提交请求，不就地重启', flush=True)
+            return
         ok = hot_restart()
         print('热重启' + ('成功' if ok else '失败'))
         return
+    if '--verify' in args:
+        print(json.dumps(verify_system(), ensure_ascii=False, indent=1)); return
     if '--check' in args or not args:
         once(dry=False); return
     if '--audit' in args:
