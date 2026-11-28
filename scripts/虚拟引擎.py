@@ -157,6 +157,18 @@ def autostart():
 def switch(skip_handover=False):
     """主引擎全挂 → 先落接续包，再用同一套配置拉起（切换）
     skip_handover=True：调用方（热重启）刚刚已经落过，不重复生成。"""
+    # 2026-11-28：引擎的拉起权归「壳」所有（容器入口 /usr/local/bin/dsh）。
+    # 这里再拉一次会跟壳打架：抢不到 3080 的那个 exit=1，壳 3 秒后再拉，形成崩循环。
+    # 所以本守护只「看」不「拉」，除非有人把归属文件改回去。
+    import json as _j, os as _o
+    _own = os.path.join('/root/workspace/记忆档案', '引擎拉起归属.json')
+    try:
+        _who = _j.load(open(_own, encoding='utf-8')).get('owner', 'virtual')
+    except Exception:
+        _who = 'virtual'
+    if _who == 'shell':
+        log('主引擎全挂，但拉起权归壳（引擎拉起归属.json）→ 本守护只记录，不拉')
+        return False
     log('主引擎全挂，虚拟引擎切换：拉起')
     if not skip_handover:
         handover_note()
