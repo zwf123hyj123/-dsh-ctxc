@@ -1,0 +1,239 @@
+- id: ui-settings-general
+  name: "@deepseek-ai/dsh-client-ui-settings-general"
+  config:
+    welcomeNoticeVersion: 2026-09-28.1
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    # 2026-11-28：云端 402「没 token」→ 默认模型切本地 ollama（通道看门狗实测本地活着）。
+    # 恢复云端后改回 our-free-model / reflection/beam-free 即可。
+    provider: custom-ollama
+    model: qwen2.5:1.5b-instruct
+    reasoningEffort: high
+    rememberLastSelection: false
+# 上传大小：单文件/单张图片上限从默认 200 MB / 50 MB 提到 2 GB
+- id: attachment-local
+  name: "@deepseek-ai/dsh-attachment-local"
+  config:
+    maxImageBytes: 2147483648
+    maxMessageImageBytes: 2147483648
+# 配套的请求体上限：client-connection 启动时校验
+# maxRequestBodyBytes >= ceil(maxMessageImageBytes * 4 / 3) + 1 MiB（此处约 2.86 GB），
+# 只调图片上限而漏掉这一行会让 connection 插件无法激活、启动直接失败。
+- id: connection
+  name: "@deepseek-ai/dsh-client-connection"
+  config:
+    maxRequestBodyBytes: 3000000000
+- id: web-search-deepseek
+  name: "@deepseek-ai/dsh-web-search-deepseek"
+  config:
+    apiKeyEnv: DEEPSEEK_API_KEY
+    maxUses: 9000
+- id: web-deepseek-api
+  name: "@deepseek-ai/dsh-web-deepseek-api"
+  config:
+    apiKeyEnv: DEEPSEEK_API_KEY
+    count: 50
+- id: subagent-model-selection-settings
+  name: "@deepseek-ai/dsh-tool-subagent/model-selection-settings"
+  config:
+    enabled: true
+    allowedModels:
+      - provider: deepseek-official
+        model: deepseek-flash
+      - provider: our-free-model
+        model: reflection/beam-free
+      - provider: our-free-model
+        model: nvidia/nemotron-3-ultra-550b-a55b:free
+      - provider: our-free-model
+        model: inclusionai/ling-3.2-flash:free
+      - provider: our-free-model
+        model: combo:auto
+      - provider: custom-ollama
+        model: qwen2.5:1.5b-instruct
+# [2026-11-26 停用] vision-toolkit：包 @anionex/dsh-vision-toolkit 未安装，启动报 patch entry not found。
+# 恢复方法：装回该包后，把下面被注释的条目还原成 - id: 段。
+# - id: vision-toolkit
+#   name: "@anionex/dsh-vision-toolkit"
+#   config:
+#     concurrency: 10
+#     maxImageBytes: 8888888888
+# 本地模型接收：指向 Windows 电脑的接出网关（10.128.80.87:8081）。
+# 覆盖 llm-pi-ai 会替换其完整 config，这里只保留经受出网关的远程路由，
+# 直连路由 local-llama 在手机上没有本地服务，已按包内说明移除。
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      local-llama-remote:
+        displayName: 本地 Qwen3（电脑）
+        api: openai-completions
+        baseURL: http://10.128.80.87:8081/v1
+        apiKeyEnv: LOCAL_LLM_EXPOSE_KEY
+        models:
+          - id: qwen3-1.7b
+            name: Qwen3-1.7B（电脑网关）
+            contextWindow: 16384
+            maxTokens: 2048
+      custom-ollama:
+        displayName: 本地ollama
+        api: openai-completions
+        baseURL: http://127.0.0.1:11436/v1
+        apiKeyEnv: CUSTOM_OLLAMA_API_KEY
+        models:
+          - id: qwen2.5:1.5b-instruct
+      chatanywhere:
+        displayName: ChatAnywhere（境外聚合）
+        api: openai-completions
+        baseURL: https://api.chatanywhere.tech/v1
+        apiKeyEnv: CHATANYWHERE_API_KEY
+        models:
+          - id: deepseek-chat
+            name: DeepSeek（ChatAnywhere）
+            contextWindow: 65536
+            maxTokens: 8192
+# [2026-11-26 停用] local-llm-receive：包在（link 到 local-llm-receive-bundle），但不在引擎配置树里，
+# modify 匹配不到 → 启动报 patch entry not found。要真启用得放进 insert 段；Windows 网关 10.128.80.87 不在线时不启用，避免启动失败。
+# - id: local-llm-receive
+#   name: dsh-local-llm-receive
+#   config:
+#     baseURL: http://10.128.80.87:8081/v1
+#     model: qwen3-1.7b
+#     # apiKey 已迁入凭据 LOCAL_LLM_EXPOSE_KEY（接收插件按 config → 凭据 → key 文件三级解析）
+#     intervalSeconds: 300
+- id: subagent
+  name: "@deepseek-ai/dsh-subagent"
+  config:
+    maxDepth: 10
+- id: bash-sandbox
+  name: "@deepseek-ai/dsh-bash-sandbox"
+  config:
+    timeoutMs: 60000
+    maxOutputBytes: 104960
+- id: agent-preset-registry
+  name: "@deepseek-ai/dsh-agent-preset-registry"
+  config:
+    default: standard
+    selectedDefault: ops-ptc
+
+# free-search-mcp：本地 MCP 服务器（无 API key，多引擎搜索 + 抓取 + 文档读取）。
+# venv 与探针脚本在 /root/workspace/free-search-mcp/；重启 App 后工具名为 mcp__free_search__*。
+# 搜索 MCP 已暂停（App「调整」面板里可以重新开启）
+
+# 搜索 MCP 已暂停（App「调整」面板里可以重新开启）
+
+# >>> dsh-go-tune:free-search（此块由 App「调整」面板管理，勿手删标记）
+- insert:
+    # 引擎启动即把 虚拟对话 / 虚拟引擎 两个只读常驻带回（幂等；已在跑就不动）。删本项即停用。
+    - id: local-autostart
+      name: /root/.dsh/local-autostart/index.mjs
+    - id: mcp-free-search
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: free_search
+        transport: stdio
+        command: /root/workspace/free-search-mcp/.venv/bin/search-mcp
+        toolCallTimeoutMs: 180000
+        failOnStartupError: false
+- id: plugin-market
+  name: "@deepseek-ai/dsh-plugin-market"
+  config:
+    indexes:
+      - https://kingcharleslzy-ai.github.io/dsh-purge/index.json
+
+# <<< dsh-go-tune:free-search
+
+# 崩溃修复（2026-11-18）：inspector 的 source state 默认上限只有 128 KiB。
+# 它把整棵 Cordis 插件树（cordis/tree）当作保留状态推送，插件多、会话多时这棵树
+# 会超过 128 KiB，裁剪后仍会撞上上限，于是从微任务里抛出
+# "inspector: source state exceeds the source-frame byte limit" 并让整个进程以
+# fatal uncaught exception 退出（2026-11-18 11:58 的崩溃）。
+# 树的大小同时受 maxCordisNodes（默认 2048）约束，放宽到 512 KiB 足够容纳，
+# 不会再触发这个内部上限。撤销：删掉本段即可（备份 cordis.patch.yml.bak-202611181202）。
+- id: experimental-inspector
+  name: "@deepseek-ai/dsh-experimental-inspector"
+  config:
+    captureFetch: true
+    maxSourceFrameBytes: 524288
+
+# 压缩引擎预留（2026-11-18）：dsh-live-compact 的 headroomTokens 默认 65536，是为
+# 1M 窗口准备的。combo:auto 里最窄的成员是 128000 窗口、maxTokens 32768，减去
+# 65536 预留后 pressureBudget 只剩 29696 —— 比任何新会话的系统提示+工具基线
+# （约 39792）还小，于是切换模型时「必须压到 29696 以下」永远压不下去，报
+# MODEL_SWITCH_COMPACTION_FAILED: no safe compaction range。这里只给免费组合单开
+# 一份策略，把预留降到 16384（阈值 = min(128000*0.8, 128000-32768-16384) = 78848），
+# 不碰本地小窗口模型（qwen3-1.7b 16384 仍走默认策略）。
+- id: compaction-spine
+  name: "dsh-live-compact"
+  config:
+    takeoverPresets: true
+    # 保留 live-compact 的「轮后小切」（切长工具输出，不调模型、有备份、安全）；
+    # 大压缩（云端摘要，免费模型压不动）改由 dsh-ctxc 断点压缩.py 处理（监控时自动）。
+    # 大窗口也允许轮后小切（不调模型，只切长工具输出，有备份）：
+    # 默认 65 万就停，本机收件箱这类 400 万+ 字符的会话需要更高上限才切得动。
+    bigGate: 5000000
+    keepRounds: 2
+    chunkMin: 800
+    modelPolicies:
+      # 2026-11-26：重要任务的 1M 免费模型（实测可用），补上压缩策略
+      - {
+          provider: our-free-model,
+          model: reflection/beam-free,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+      - {
+          provider: our-free-model,
+          model: nvidia/nemotron-3-ultra-550b-a55b:free,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+      - {
+          provider: our-free-model,
+          model: inclusionai/ling-3.2-flash:free,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+      # 阈值顶到物理上限：threshold = min(window*ratio, window - maxTokens - headroom)
+      # 128000 窗口 + 16384 输出预留 → 111616；1M 窗口成员跟着放大。
+      - {
+          provider: our-free-model,
+          model: combo:auto,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+      - {
+          provider: our-free-model,
+          model: deepseek-v4.1-flash-free,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+      - {
+          provider: our-free-model,
+          model: mimo-v2.6-flash-free,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+      - {
+          provider: our-free-model,
+          model: longcat-2.5-free,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+      - {
+          provider: our-free-model,
+          model: iceman-free,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+      - {
+          provider: our-free-model,
+          model: kilo-auto/free,
+          thresholdRatio: 0.3,
+          headroomTokens: 16384
+        }
+- id: agent-loop
+  name: "@deepseek-ai/dsh-agent-loop"
+  config:
+    agents: []
+    maxParallelToolCalls: 40

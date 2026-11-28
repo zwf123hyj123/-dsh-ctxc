@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="DSH" />
+    <link rel="icon" type="image/svg+xml" href="./favicon-dark.svg" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" media="(prefers-color-scheme: light)" />
+    <title>DeepSeek Harness</title>
+    <script type="module" crossorigin src="./assets/index-BgUyXZcc.js"></script>
+    <link rel="modulepreload" crossorigin href="./assets/vendor-BUMdD3V7.js">
+    <link rel="stylesheet" crossorigin href="./assets/vendor-DV2921Zo.css">
+    <link rel="stylesheet" crossorigin href="./assets/index-lh_YM6sT.css">
+      <script>
+      // 2026-11-28 加：引擎重启后自动重连，不用手动刷新。
+      // 做法：每 2 秒探一次同源 /manifest.webmanifest（静态小文件，不吃引擎状态）；
+      // 连续 2 次拿不到（引擎正在重启）→ 之后一旦恢复，自动 location.reload() 一次。
+      (function () {
+        var miss = 0, reloading = false;
+        function probe() {
+          fetch('./manifest.webmanifest?ping=' + Date.now(), { cache: 'no-store' })
+            .then(function (r) {
+              if (!r.ok) throw new Error('bad');
+              if (miss >= 2 && !reloading) {
+                reloading = true;
+                location.reload();
+              }
+              miss = 0;
+            })
+            .catch(function () {
+              miss += 1;
+            });
+        }
+        setInterval(probe, 2000);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

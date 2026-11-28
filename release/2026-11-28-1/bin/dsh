@@ -1,0 +1,91 @@
+#!/bin/sh
+# dsh-purge shim begin
+if [ -z "${DSH_HOME:-}" ]; then
+  _dsh_shim_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+  for _dsh_rel in "$_dsh_shim_dir/.dsh" "$_dsh_shim_dir/../.dsh" "$_dsh_shim_dir/../../.dsh"; do
+    if [ -d "$_dsh_rel" ]; then DSH_HOME=$(CDPATH= cd -- "$_dsh_rel" && pwd); export DSH_HOME; break; fi
+  done
+  unset _dsh_shim_dir _dsh_rel
+fi
+# dsh-purge shim end
+# dsh-purge boot hook (2026-11-25): 每次启动自动重打补丁，幂等、失败不阻塞
+/opt/node/bin/node /root/workspace/purge-boot.mjs >/dev/null 2>&1 || true
+
+# ---- dsh stop / start / restart / status（2026-11-28 加）----
+# 为什么要这三个：壳只认 /tmp/dsh-stop.marker，别的都当「该重启」。
+# 有命令之后，「我要停」和「我要重启」不必再靠手动碰文件。
+_dsh_engine_pid() {
+  for _p in $(ls /proc | grep -E '^[0-9]+$'); do
+    _c=$(tr '\0' ' ' < /proc/$_p/cmdline 2>/dev/null) || continue
+    case "$_c" in *"dsh/lib/bin.js web"*) echo "$_p"; return 0;; esac
+  done
+  return 1
+}
+_dsh_port_open() {
+  curl -s -o /dev/null --max-time 2 http://127.0.0.1:3080/ 2>/dev/null
+}
+case "$1" in
+  status)
+    _e=$(_dsh_engine_pid || echo '-')
+    _s=$(ps -eo pid,cmd | grep "[/]usr/local/bin/dsh web" | awk '{print $1}' | head -1)
+    echo "壳(容器入口): ${_s:-无}"
+    echo "引擎: ${_e}"
+    _dsh_port_open && echo "3080: 通" || echo "3080: 不通"
+    for _k in "虚拟引擎.py" "虚拟对话.py" "eigenflux"; do
+      _n=$(ps -eo cmd | grep -F -c "$_k")
+      echo "常驻[$_k]: $_n"
+    done
+    exit 0;;
+  stop)
+    echo '停止：写 stop 标记并结束引擎，壳见到标记后退出（容器随之结束）'
+    : > /tmp/dsh-stop.marker
+    _e=$(_dsh_engine_pid) && { kill -TERM "$_e"; echo "已通知引擎 $_e 退出"; } || echo "引擎本来就没在跑"
+    exit 0;;
+  start)
+    rm -f /tmp/dsh-stop.marker
+    if _dsh_port_open; then echo "已经在跑（3080 通），不用拉"; exit 0; fi
+    echo '拉起引擎（脱离当前会话，日志 /tmp/dsh-web.log）'
+    setsid nohup /opt/node/bin/node --import=/opt/dsh-go/boot-cache.mjs \
+      /opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js web "$@" \
+      --patch /etc/dsh-app/dsh-web.patch.yml >> /tmp/dsh-web.log 2>&1 < /dev/null &
+    _i=0
+    while [ $_i -lt 60 ]; do _dsh_port_open && { echo "起来了（${_i}s）"; exit 0; }; sleep 1; _i=$((_i+1)); done
+    echo "60 秒还没通，看 /tmp/dsh-web.log"; exit 1;;
+  restart)
+    rm -f /tmp/dsh-stop.marker
+    _e=$(_dsh_engine_pid) || { echo "引擎没在跑；用 dsh start 拉起"; exit 1; }
+    echo "重启引擎 $_e（壳会在 3 秒内拉起）"; kill -TERM "$_e"; exit 0;;
+esac
+
+# dsh-app shim: run the bundled DeepSeek Harness CLI with the bundled Node.
+# `dsh web` (the app's launch) preloads the boot cache, /opt/dsh-go/boot-cache.mjs.
+# 2026-11-28 引路人：「不杀容器不行么」——改成看护壳：容器入口是这层 sh，引擎是它的子进程。
+# 这样 kill 引擎只是重启引擎，容器（proot）与常驻（虚拟引擎/ollama）都不用陪葬。
+# 只有 web 子命令走看护；其它用法保持 exec 语义。
+if [ "$1" = web ]; then
+  while :; do
+    # 2026-11-28 11:0x 加：别人（app 或虚拟引擎守护者）已经在监听 3080 时，壳不去抢。
+    # 起因：壳和虚拟引擎同时各拉一个引擎 → 抢不到端口的那个 exit=1 → 壳 3 秒后再拉 → 崩循环。
+    if (exec 3<>/dev/tcp/127.0.0.1/3080) 2>/dev/null; then
+      exec 3>&- 2>/dev/null || true
+      sleep 5
+      continue
+    fi
+    _t0=$(date +%s)
+    /opt/node/bin/node --import=/opt/dsh-go/boot-cache.mjs /opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js "$@"
+    _code=$?
+    _dt=$(( $(date +%s) - _t0 ))
+    printf '[%s] engine exit=%s 运行=%ss\n' "$(date '+%F %T')" "$_code" "$_dt" >> /tmp/engine-supervisor.log
+    # 2026-11-28 11:0x 修（第一次实测就翻车的教训）：
+    # 原来「退出码 0 且活过 30 秒＝主动关闭」——但 kill -TERM 也让 node 干净退出（code 0），
+    # 于是壳把「我让你重启」当成「你主动关掉」，自己 break 了，整条链就此断掉。
+    # 现在只认一个显式信号：/tmp/dsh-stop.marker 存在才不拉起；其余任何退出都拉。
+    if [ -f /tmp/dsh-stop.marker ]; then
+      printf '[%s] 见到停止标记，壳退出\n' "$(date '+%F %T')" >> /tmp/engine-supervisor.log
+      break
+    fi
+    sleep 3
+  done
+  exit 0
+fi
+exec /opt/node/bin/node /opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js "$@"
